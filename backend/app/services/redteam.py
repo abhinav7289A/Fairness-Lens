@@ -29,6 +29,23 @@ from app.core.fairness import FairnessEngine
 logger = logging.getLogger(__name__)
 
 
+def _sanitize(obj):
+    """Convert numpy types to native Python types for JSON serialization."""
+    if isinstance(obj, dict):
+        return {k: _sanitize(v) for k, v in obj.items()}
+    elif isinstance(obj, (list, tuple)):
+        return [_sanitize(v) for v in obj]
+    elif isinstance(obj, np.bool_):
+        return bool(obj)
+    elif isinstance(obj, np.integer):
+        return int(obj)
+    elif isinstance(obj, np.floating):
+        return float(obj)
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+    return obj
+
+
 # ═══════════════════════════════════════
 #  DATA STRUCTURES
 # ═══════════════════════════════════════
@@ -61,6 +78,35 @@ class RedTeamSession:
     worst_overall_di: float = 1.0
     root_cause: list[str] = field(default_factory=list)
     status: str = "running"
+
+    def to_dict(self) -> dict:
+        """Convert to a JSON-safe dictionary with all numpy types sanitized."""
+        return _sanitize({
+            "session_id": self.session_id,
+            "dataset_id": self.dataset_id,
+            "rounds": [
+                {
+                    "round_num": r.round_num,
+                    "target_subgroup": r.target_subgroup,
+                    "profiles_generated": r.profiles_generated,
+                    "attacker_strategy": r.attacker_strategy,
+                    "subgroup_results": r.subgroup_results,
+                    "worst_subgroup": r.worst_subgroup,
+                    "worst_di": r.worst_di,
+                    "worst_severity": r.worst_severity,
+                    "root_cause_features": r.root_cause_features,
+                    "auditor_analysis": r.auditor_analysis,
+                    "done": r.done,
+                }
+                for r in self.rounds
+            ],
+            "conversation_trace": self.conversation_trace,
+            "final_summary": self.final_summary,
+            "worst_overall_subgroup": self.worst_overall_subgroup,
+            "worst_overall_di": self.worst_overall_di,
+            "root_cause": self.root_cause,
+            "status": self.status,
+        })
 
 
 _sessions: dict[str, RedTeamSession] = {}
@@ -161,22 +207,20 @@ def _generate_synthetic_profiles(
         elif col == "race" and target_race is not None:
             profiles[col] = [target_race] * n
         elif col == "age":
-            profiles[col] = np.random.randint(30, 55, n)
+            profiles[col] = np.random.randint(30, 55, n).tolist()
         elif col == "education_num":
-            profiles[col] = np.random.randint(13, 17, n)  # high education
+            profiles[col] = np.random.randint(13, 17, n).tolist()
         elif col == "hours_per_week":
-            profiles[col] = np.random.randint(40, 60, n)  # hard workers
+            profiles[col] = np.random.randint(40, 60, n).tolist()
         elif col == "capital_gain":
-            profiles[col] = np.random.randint(3000, 15000, n)
+            profiles[col] = np.random.randint(3000, 15000, n).tolist()
         elif col == "capital_loss":
-            profiles[col] = np.zeros(n, dtype=int)
+            profiles[col] = [0] * n
         elif pd.api.types.is_numeric_dtype(df[col]):
-            # Use 75th percentile (above average)
-            p75 = df[col].quantile(0.75)
-            profiles[col] = np.full(n, p75)
+            p75 = float(df[col].quantile(0.75))
+            profiles[col] = [p75] * n
         else:
-            # Categorical: sample from existing values
-            profiles[col] = np.random.choice(df[col].dropna().unique(), n)
+            profiles[col] = np.random.choice(df[col].dropna().unique(), n).tolist()
 
     return pd.DataFrame(profiles)
 
@@ -206,21 +250,25 @@ def _compute_subgroup_results(
 
     for group_key, group_idx in groups.groups.items():
         group_preds = y_pred[group_idx.values] if hasattr(group_idx, 'values') else y_pred[list(group_idx)]
-        selection_rate = np.mean(group_preds == favorable_label) if len(group_preds) > 0 else 0.0
+        selection_rate = float(np.mean(group_preds == favorable_label)) if len(group_preds) > 0 else 0.0
 
         key_str = str(group_key) if isinstance(group_key, tuple) else str(group_key)
         subgroup_rates[key_str] = selection_rate
         max_rate = max(max_rate, selection_rate)
 
     for subgroup, rate in subgroup_rates.items():
-        di = rate / max_rate if max_rate > 0 else 0.0
+        di = float(rate / max_rate) if max_rate > 0 else 0.0
+        try:
+            count = len(groups.groups.get(
+                eval(subgroup) if subgroup.startswith("(") else subgroup, []
+            ))
+        except Exception:
+            count = 0
         results.append({
             "subgroup": subgroup,
             "selection_rate": round(rate, 4),
             "di_ratio": round(di, 4),
-            "count": int(sum(1 for g in groups.groups.get(
-                eval(subgroup) if subgroup.startswith("(") else subgroup, []
-            ))),
+            "count": int(count),
             "severity": FairnessEngine.classify_severity(di).value,
         })
 
@@ -236,7 +284,6 @@ def _identify_root_cause_features(
     subgroup_mask: np.ndarray,
 ) -> list[str]:
     """Identify features most associated with rejection in the worst subgroup."""
-    # Compare mean feature values between selected and rejected in subgroup
     rejected = (y_pred != favorable_label) & subgroup_mask
     selected = (y_pred == favorable_label) & subgroup_mask
 
@@ -245,8 +292,8 @@ def _identify_root_cause_features(
 
     feature_diffs = []
     for i, feat in enumerate(feature_names):
-        mean_rej = np.mean(X[rejected, i])
-        mean_sel = np.mean(X[selected, i])
+        mean_rej = float(np.mean(X[rejected, i]))
+        mean_sel = float(np.mean(X[selected, i]))
         diff = abs(mean_sel - mean_rej)
         feature_diffs.append((feat, diff))
 
@@ -322,7 +369,7 @@ async def run_red_team(
 
     # ── Red Team Loop ──
     target_subgroup = "all"
-    api_key = os.environ.get("GOOGLE_API_KEY", "")
+    api_key = os.environ.get("GOOGLE_API_KEY", "").strip()
     use_gemini = bool(api_key)
 
     for round_num in range(1, max_rounds + 1):
@@ -360,7 +407,6 @@ async def run_red_team(
         for col in synth_encoded.columns:
             if col in label_encoders:
                 le = label_encoders[col]
-                # Handle unseen values
                 known = set(le.classes_)
                 synth_encoded[col] = synth_encoded[col].apply(
                     lambda x: le.transform([str(x)])[0] if str(x) in known else 0
@@ -370,7 +416,6 @@ async def run_red_team(
                 synth_encoded[col] = le.fit_transform(synth_encoded[col].astype(str))
 
         synth_features = synth_encoded[[c for c in feature_cols if c in synth_encoded.columns]]
-        # Add missing columns
         for col in feature_cols:
             if col not in synth_features.columns:
                 synth_features[col] = 0
@@ -385,9 +430,9 @@ async def run_red_team(
         # Find worst subgroup
         if subgroup_results:
             worst = subgroup_results[0]  # already sorted ascending by DI
-            worst_subgroup = worst["subgroup"]
-            worst_di = worst["di_ratio"]
-            worst_severity = worst["severity"]
+            worst_subgroup = str(worst["subgroup"])
+            worst_di = float(worst["di_ratio"])
+            worst_severity = str(worst["severity"])
         else:
             worst_subgroup = "unknown"
             worst_di = 1.0
@@ -396,7 +441,6 @@ async def run_red_team(
         # Root cause analysis
         root_features = []
         if subgroup_results and worst_di < 0.8:
-            # Create mask for worst subgroup in synthetic data
             if "sex" in synthetic_df.columns and "race" in synthetic_df.columns:
                 try:
                     parts = eval(worst_subgroup) if worst_subgroup.startswith("(") else (worst_subgroup,)
@@ -422,7 +466,7 @@ async def run_red_team(
         # Check if done
         done = worst_di >= 0.80 or round_num >= max_rounds
         if round_num > 1 and target_subgroup == worst_subgroup:
-            done = True  # Same subgroup probed twice
+            done = True
 
         session.conversation_trace.append({
             "agent": "Auditor",
@@ -442,7 +486,7 @@ async def run_red_team(
             worst_severity=worst_severity,
             root_cause_features=root_features,
             auditor_analysis=auditor_msg,
-            done=done,
+            done=bool(done),
         )
         session.rounds.append(round_result)
 
@@ -480,7 +524,6 @@ def _generate_diverse_profiles(
     feature_cols = [c for c in df.columns if c != label_column]
 
     if target_subgroup == "all":
-        # Generate profiles for every (sex, race) combination
         sex_vals = df["sex"].unique() if "sex" in df.columns else ["Unknown"]
         race_vals = df["race"].unique() if "race" in df.columns else ["Unknown"]
 
@@ -537,11 +580,9 @@ Generate exactly 10 profiles matching the column format above."""
 
         text = text.replace("```json", "").replace("```", "").strip()
 
-        # Try to repair truncated JSON
         try:
             data = json.loads(text)
         except json.JSONDecodeError:
-            # Try closing brackets
             for suffix in ["]}", "]}}", '"]}', '"}]}']:
                 try:
                     data = json.loads(text + suffix)
